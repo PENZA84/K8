@@ -13,34 +13,32 @@ MAX_URLS = 10000
 WORKER_THREADS = 32
 url_queue = queue.Queue()
 processed_urls = set()
-all_nodes_data = []  # 存储完整的节点字典
+# 使用字典进行去重：key为唯一标识(UUID或URI)
+all_nodes_dict = {} 
 lock = threading.Lock()
 
-# 维持会话池以复用连接
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64)
 session.mount('https://', adapter)
 
-# 核心正则 (非捕获)
 NODE_URI_REGEX = re.compile(r'(?:vless|hy2|hysteria2|hysteria|tuic)://[^\s"\'<>]+')
 LINK_REGEX = re.compile(r'https?://[^\s"\'<>]+')
 
 # ======================
-# 深度提取函数
+# 工具函数
 # ======================
-def extract_clash_yaml(content):
-    """解析完整的 Clash YAML 节点，返回字典列表"""
-    nodes = []
+def safe_b64_decode(data):
+    # 长度校验：Base64 编码通常是 4 的倍数，且节点数据量大
+    if len(data) < 16: return ""
+    clean_data = re.sub(r'[^A-Za-z0-9+/=]', '', data)
     try:
-        data = yaml.safe_load(content)
-        if isinstance(data, dict) and 'proxies' in data:
-            for p in data['proxies']:
-                # 直接保留整个字典，完整保存所有配置项
-                nodes.append(p)
+        return base64.b64decode(clean_data).decode('utf-8', errors='ignore')
     except:
-        pass
-    return nodes
+        return ""
 
+# ======================
+# 工作线程逻辑
+# ======================
 def worker():
     while True:
         try:
@@ -51,38 +49,55 @@ def worker():
         try:
             res = session.get(url, timeout=10, headers={'User-Agent': 'clash-verge/v2.0.2'}, allow_redirects=True)
             content = res.text
+            real_url = res.url
             
-            # 1. 完整节点提取
-            found_data = []
+            found_nodes = []
             
-            # 如果包含 proxies，则作为 YAML 解析
+            # 1. YAML 解析 (保留完整对象)
             if "proxies:" in content:
-                found_data.extend(extract_clash_yaml(content))
+                try:
+                    data = yaml.safe_load(content)
+                    if isinstance(data, dict) and 'proxies' in data:
+                        for p in data['proxies']:
+                            p['source_url'] = real_url # 添加溯源
+                            found_nodes.append(p)
+                except: pass
             
-            # 无论是否为 YAML，都尝试提取文本中的 URI (兼容 Base64)
-            if not re.fullmatch(r'[A-Za-z0-9+/=\r\n]+', content.strip()): # 非纯Base64判断
+            # 2. URI 解析 (Base64 或 纯文本)
+            if not re.fullmatch(r'[A-Za-z0-9+/=\r\n]+', content.strip()):
                 uris = NODE_URI_REGEX.findall(content)
-                found_data.extend([{'type': 'uri', 'uri': u} for u in uris])
+                found_nodes.extend([{'type': 'uri', 'uri': u, 'source_url': real_url} for u in uris])
+            else:
+                decoded = safe_b64_decode(content)
+                uris = NODE_URI_REGEX.findall(decoded)
+                found_nodes.extend([{'type': 'uri', 'uri': u, 'source_url': real_url} for u in uris])
             
-            if found_data:
+            # 3. 去重与存储
+            if found_nodes:
                 with lock:
-                    all_nodes_data.extend(found_data)
+                    for n in found_nodes:
+                        # 以 uuid 或 uri 作为唯一性判断
+                        key = n.get('uuid') or n.get('uri') or str(n)
+                        if key not in all_nodes_dict:
+                            all_nodes_dict[key] = n
             
-            # 2. 递归发现更多订阅 (处理跳转后的真实 URL)
+            # 4. 递归发现
             if len(processed_urls) < MAX_URLS:
                 new_links = LINK_REGEX.findall(content)
-                new_links.append(res.url) # 添加跳转后的真实地址
-                
+                new_links.append(real_url)
                 with lock:
                     for link in set(new_links):
-                        if any(k in link for k in ['sub', 'subscribe', 'proxy', 'raw.githubusercontent.com', 'clash']) and link not in processed_urls:
+                        if any(k in link for k in ['sub', 'subscribe', 'proxy', 'raw.githubusercontent.com']) and link not in processed_urls:
                             processed_urls.add(link)
                             url_queue.put(link)
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"解析 {url} 失败: {e}")
         finally:
             url_queue.task_done()
 
+# ======================
+# 主程序
+# ======================
 if __name__ == '__main__':
     with open('latest.yaml', 'r', encoding="utf-8") as f:
         for urls in yaml.safe_load(f).values():
@@ -91,13 +106,11 @@ if __name__ == '__main__':
                     processed_urls.add(url)
                     url_queue.put(url)
 
-    logger.info(f"开始深度挖掘，队列: {url_queue.qsize()}")
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(WORKER_THREADS)]
     for t in threads: t.start()
     url_queue.join()
     
-    # 导出完整节点对象
     with open('all_nodes.yaml', 'w', encoding="utf-8") as f:
-        yaml.dump(all_nodes_data, f, allow_unicode=True)
+        yaml.dump(list(all_nodes_dict.values()), f, allow_unicode=True)
     
-    logger.info(f"解析完成，共获取节点对象: {len(all_nodes_data)}，已保存至 all_nodes.yaml")
+    logger.info(f"解析完成，共获取唯一节点: {len(all_nodes_dict)}")

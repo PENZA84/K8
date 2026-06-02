@@ -140,7 +140,15 @@ def process_nodes(input_file='all_nodes.yaml', output_dir='output'):
                 f.write('\n'.join(lst))
             total += len(lst)
         
-        print(f"转换完成，总计 {total} 条标准化 URI，输出到 {output_dir}/")
+        # 合并输出到 all_nodes.txt
+        with open('all_nodes.txt', 'w', encoding='utf-8') as f_out:
+            for scheme in ALLOWED_PROTOCOLS:
+                filename = os.path.join(output_dir, f"{scheme}_nodes.txt")
+                if os.path.exists(filename):
+                    with open(filename, 'r', encoding='utf-8') as f_in:
+                        f_out.write(f_in.read() + '\n')
+        
+        print(f"转换完成，总计 {total} 条标准化 URI，已生成分流文件及 all_nodes.txt")
     
     except Exception as e:
         print(f"执行失败: {e}")

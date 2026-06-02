@@ -3,8 +3,8 @@ name: Fetch Subscriptions
 on:
   push:
     paths:
-      - '.github/workflows/fetch.yaml' # 监控工作流文件改动
-      - 'w38.py'                            # 监控脚本改动
+      - '.github/workflows/fetch.yaml'
+      - 'w38.py'
   workflow_dispatch:
   schedule:
     # 北京时间每天 00:00 和 12:00 运行 (UTC 16:00 和 04:00)
@@ -15,7 +15,7 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须赋予写入权限
+      contents: write
       
     steps:
       - name: 检出仓库
@@ -32,7 +32,7 @@ jobs:
 
       - name: 执行任务
         env:
-           TZ: Asia/Shanghai
+          TZ: Asia/Shanghai 
         run: |
           python w38.py
 
@@ -41,17 +41,20 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # 清理环境，确保没有冲突
-          git reset --hard HEAD
-          git clean -fd
+          # 拉取远程最新内容，确保在本地是最新的，防止推送冲突
           git pull --rebase origin main
           
-          git add .
+          # 将生成的文件添加到暂存区
+          # 明确指定这几个文件，比 git add . 更安全
+          git add latest.yaml url.txt v2ray.txt channel_stats.csv
+          
+          # 检查是否有实际变更
           if git diff --quiet --staged; then
             echo "无更改需要提交"
             exit 0
           fi
           
+          # 提交更改
           git commit -m "🍀 自动更新订阅 $(date '+%Y-%m-%d %H:%M:%S')"
           git push
         env:

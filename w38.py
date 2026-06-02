@@ -1,130 +1,111 @@
 import re
 import yaml
-import threading
 import base64
 import requests
-import csv
+import threading
 import queue
 from loguru import logger
 from tqdm import tqdm
-from retry import retry
-from urllib.parse import unquote
-from datetime import datetime
-from collections import defaultdict
 
 # ======================
-# 全局数据
+# 配置与数据
 # ======================
-new_sub_list = []
-new_clash_list = []
-new_v2_list = []
-all_nodes_list = []  # 最终提取的节点内容
-processed_urls = set()
+MAX_URLS = 10000
+WORKER_THREADS = 32
 url_queue = queue.Queue()
-
+processed_urls = set()
+all_nodes = set()
 lock = threading.Lock()
-max_concurrency = threading.Semaphore(64)
-MAX_URLS = 10000  # 防止递归无限扩散
 
-session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=0)
-session.mount('http://', adapter)
-session.mount('https://', adapter)
+# 基础协议正则（使用非捕获组）
+NODE_REGEX = re.compile(r'(?:vless|hy2|hysteria2|hysteria|tuic)://[^\s"\'<>]+')
+# 查找订阅链接的正则
+LINK_REGEX = re.compile(r'https?://[^\s"\'<>]+')
 
 # ======================
 # 工具函数
 # ======================
-def is_valid_protocol(text):
-    # 严格排除 vmess/trojan，仅保留指定协议
-    return any(x in text for x in ['vless://', 'hy2://', 'hysteria2://', 'hysteria://', 'tuic://'])
-
 def safe_b64_decode(data):
     try:
-        data = data.strip()
+        # 处理可能包含的 Base64 杂质
+        data = re.sub(r'[^A-Za-z0-9+/=]', '', data)
         pad = '=' * (-len(data) % 4)
-        return base64.b64decode(data + pad, validate=False).decode(errors='ignore')
+        return base64.b64decode(data + pad).decode('utf-8', errors='ignore')
     except:
         return ""
 
+def extract_nodes(content):
+    """提取 Base64 订阅或纯节点文本中的节点"""
+    nodes = NODE_REGEX.findall(content)
+    # 处理 Clash YAML 格式的节点 (简化提取)
+    if 'proxies:' in content:
+        # 尝试提取 server: 后的 IP/域名 (粗略提取，仅作补充)
+        servers = re.findall(r'server:\s*([^\s]+)', content)
+        # 这里可以加入更复杂的 Clash 配置解析逻辑
+    return nodes
+
 # ======================
-# 核心：订阅深度解析
+# 工作线程逻辑
 # ======================
-@logger.catch
-def process_subscription(url, bar):
-    headers = {'User-Agent': 'clash-verge/v2.0.2'}
-    try:
-        res = session.get(url, headers=headers, timeout=8)
-        if res.status_code != 200: return
-        
-        content = res.text
-        
-        # 1. 解码 Base64 并提取节点
-        decoded_content = safe_b64_decode(content)
-        if decoded_content:
-            # 提取节点
-            nodes = re.findall(r'(vless://|hy2://|hysteria2://|hysteria://|tuic://)[^\s|]+', decoded_content)
-            if nodes:
+def worker():
+    while True:
+        try:
+            url = url_queue.get(timeout=3)
+        except queue.Empty:
+            break
+            
+        try:
+            res = requests.get(url, timeout=10, headers={'User-Agent': 'clash-verge/v2.0.2'})
+            if res.status_code == 200:
+                content = res.text
+                
+                # 1. 尝试提取节点
+                found_nodes = []
+                if any(x in content for x in ["proxies:", "proxy-groups:"]):
+                    found_nodes = extract_nodes(content)
+                else:
+                    decoded = safe_b64_decode(content)
+                    found_nodes = NODE_REGEX.findall(decoded) if decoded else NODE_REGEX.findall(content)
+                
                 with lock:
-                    all_nodes_list.extend([n for n in nodes if is_valid_protocol(n)])
-                    new_v2_list.append(url)
-        
-        # 2. 如果是 Clash YAML，提取节点信息
-        if 'proxies:' in content:
-            with lock: new_clash_list.append(url)
-        
-        # 3. 递归挖掘：提取其中的 URL 并按白名单过滤
-        allow_list = ['sub', 'subscribe', 'proxy', 'proxies', 'raw.githubusercontent.com', 'tt.vg', 'shz.al']
-        found_links = re.findall(r'https?://[^\s"\'<>]+', content)
-        
-        with lock:
-            if len(processed_urls) < MAX_URLS:
-                for link in found_links:
-                    clean_link = link.strip().rstrip(')')
-                    if any(x in clean_link for x in allow_list) and clean_link not in processed_urls:
-                        processed_urls.add(clean_link)
-                        url_queue.put(clean_link)
-    except:
-        pass
-    
-    with lock: bar.update(1)
+                    all_nodes.update(found_nodes)
+                
+                # 2. 递归发现更多订阅
+                if len(processed_urls) < MAX_URLS:
+                    new_links = LINK_REGEX.findall(content)
+                    with lock:
+                        for link in new_links:
+                            if any(k in link for k in ['sub', 'clash', 'proxy', 'raw.githubusercontent.com']) and link not in processed_urls:
+                                processed_urls.add(link)
+                                url_queue.put(link)
+        except:
+            pass
+        finally:
+            url_queue.task_done()
 
 # ======================
 # 主程序
 # ======================
 if __name__ == '__main__':
-    # 1. 读取 latest.yaml 并填入队列
-    try:
-        with open('latest.yaml', 'r', encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-            for key, urls in data.items():
-                for url in urls:
-                    if url not in processed_urls:
-                        processed_urls.add(url)
-                        url_queue.put(url)
-        logger.info(f'从 latest.yaml 加载了 {url_queue.qsize()} 个订阅源')
-    except FileNotFoundError:
-        logger.warning('未找到 latest.yaml，请先运行基础抓取脚本')
+    # 从 latest.yaml 加载种子
+    with open('latest.yaml', 'r', encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+        for urls in data.values():
+            for url in urls:
+                if url not in processed_urls:
+                    processed_urls.add(url)
+                    url_queue.put(url)
 
-    # 2. 开始深度递归解析
-    bar = tqdm(total=url_queue.qsize(), desc='深度解析中')
-    threads = []
+    logger.info(f"开始解析，初始队列: {url_queue.qsize()}")
     
-    while not url_queue.empty():
-        url = url_queue.get()
-        t = threading.Thread(target=process_subscription, args=(url, bar))
+    threads = []
+    for _ in range(WORKER_THREADS):
+        t = threading.Thread(target=worker, daemon=True)
         t.start()
         threads.append(t)
         
-        # 简单控制并发，防止线程过多
-        if len(threads) > 32:
-            for t in threads: t.join()
-            threads = []
-
-    for t in threads: t.join()
-    bar.close()
-
-    # 3. 导出所有提取到的节点
-    with open('all_nodes.txt', 'w', encoding="utf-8") as f:
-        f.write('\n'.join(set(all_nodes_list)))
+    url_queue.join()
     
-    logger.info(f'解析完成。已提取节点数: {len(all_nodes_list)}，已保存至 all_nodes.txt')
+    with open('all_nodes.txt', 'w', encoding="utf-8") as f:
+        f.write('\n'.join(all_nodes))
+    logger.info(f"全部完成，共提取节点: {len(all_nodes)}")

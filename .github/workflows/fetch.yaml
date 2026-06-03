@@ -15,7 +15,7 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 必须具有写入权限
+      contents: write
       
     steps:
       - name: 检出仓库
@@ -44,13 +44,19 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # 2. 拉取最新代码（防止冲突）
+          # 2. 将当前更改放入暂存区，防止拉取冲突
+          git stash --include-untracked
+          
+          # 3. 拉取最新代码（防止冲突）
           git pull --rebase origin main
           
-          # 3. 添加更改
+          # 4. 恢复之前的更改
+          git stash pop || echo "No stash to pop"
+          
+          # 5. 添加更改
           git add latest.yaml url.txt channel_stats.csv
           
-          # 4. 检查是否有变更，有则提交，无则静默退出
+          # 6. 检查是否有变更，有则提交，无则静默退出
           if git diff --quiet --cached; then
             echo "没有检测到文件变更，跳过提交。"
           else

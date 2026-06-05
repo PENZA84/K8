@@ -52,6 +52,9 @@ def extract_channels(nodes):
 
 def update_config_yaml(new_channels, config_file='config.yaml'):
     """读取 config.yaml 并与新频道合并去重后保存"""
+    # 强制确保路径指向当前工作目录
+    config_file = os.path.join(os.getcwd(), config_file)
+    
     if not os.path.exists(config_file):
         data = {'tgchannel': []}
     else:

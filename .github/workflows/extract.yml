@@ -1,0 +1,51 @@
+name: Node Extraction Workflow
+
+on:
+  push:
+    paths:
+      - 'deep_extract.py'
+      - 'converter.py'
+      - 'latest.yaml'
+      - '.github/workflows/extract.yml'
+  schedule:
+    - cron: 0 */3 * * *
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml requests loguru
+
+      - name: Run extraction script
+        run: python deep_extract.py
+
+      - name: Convert to URI list
+        run: python converter.py
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'github-actions@github.com'
+          
+          # 核心修正：取消对单一文件的限制，检查工作区所有文件的变更状态
+          # 这样只要 all_nodes.txt 或 config.yaml 中任意一个发生了变更，都会触发提交
+          if [ -n "$(git status --porcelain)" ]; then
+            git add all_nodes.txt config.yaml
+            git commit -m "Auto-update nodes: $(date '+%Y-%m-%d %H:%M:%S')"
+            git push
+          else
+            echo "No changes to commit."
+          fi
